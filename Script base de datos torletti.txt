@@ -1,0 +1,176 @@
+-- ============================================================
+--  BASE DE DATOS - SQL Server
+--  Versión 3 — Estructura simplificada y mejorada
+-- ============================================================
+
+
+-- ------------------------------------------------------------
+-- 1. ROLES  (superadmin | admin)
+-- ------------------------------------------------------------
+CREATE TABLE roles (
+    id_rol      INT            IDENTITY(1,1) PRIMARY KEY,
+    nombre      NVARCHAR(50)   NOT NULL UNIQUE,
+    descripcion NVARCHAR(255)  NULL,
+    creado_en   DATETIME2      NOT NULL DEFAULT GETDATE()
+);
+
+INSERT INTO roles (nombre, descripcion) VALUES
+    ('superadmin', 'Control total del sistema. Gestiona admins y sube PDFs.'),
+    ('admin',      'Registra y gestiona clientes mayoristas.');
+
+
+-- ------------------------------------------------------------
+-- 2. USUARIOS  (superadmin y admins del sistema)
+-- ------------------------------------------------------------
+CREATE TABLE usuarios (
+    id_usuario     INT            IDENTITY(1,1) PRIMARY KEY,
+    id_rol         INT            NOT NULL,
+    nombre         NVARCHAR(100)  NOT NULL,
+    apellido       NVARCHAR(100)  NOT NULL,
+    email          NVARCHAR(150)  NOT NULL UNIQUE,
+    password_hash  NVARCHAR(255)  NOT NULL,            -- bcrypt / Argon2, NUNCA texto plano
+    activo         BIT            NOT NULL DEFAULT 1,
+    creado_en      DATETIME2      NOT NULL DEFAULT GETDATE(),
+    actualizado_en DATETIME2      NULL,
+
+    CONSTRAINT FK_usuarios_roles FOREIGN KEY (id_rol)
+        REFERENCES roles(id_rol)
+);
+
+CREATE INDEX IX_usuarios_email ON usuarios(email);
+CREATE INDEX IX_usuarios_rol   ON usuarios(id_rol);
+
+
+-- ------------------------------------------------------------
+-- 3. CLIENTES MAYORISTAS
+--    · El admin los registra y gestiona.
+--    · El usuario de acceso es el CUIT.
+--    · El admin genera un código temporal que se envía por mail.
+--    · El cliente debe cambiar la contraseña al primer ingreso.
+-- ------------------------------------------------------------
+CREATE TABLE clientes_mayoristas (
+    id_cliente         INT            IDENTITY(1,1) PRIMARY KEY,
+    razon_social       NVARCHAR(200)  NOT NULL,
+    cuit               NVARCHAR(20)   NOT NULL UNIQUE,  -- usuario de acceso: XX-XXXXXXXX-X
+    email              NVARCHAR(150)  NOT NULL UNIQUE,  -- donde se envía el código temporal
+    telefono           NVARCHAR(30)   NULL,
+    password_hash      NVARCHAR(255)  NOT NULL,         -- código temporal hasheado al crear, luego la contraseña propia
+    debe_cambiar_clave BIT            NOT NULL DEFAULT 1, -- 1 = todavía usa código temporal
+    activo             BIT            NOT NULL DEFAULT 1,
+    creado_en          DATETIME2      NOT NULL DEFAULT GETDATE(),
+    actualizado_en     DATETIME2      NULL,
+    creado_por         INT            NOT NULL,          -- FK al admin que lo registró
+
+    CONSTRAINT FK_clientes_creado_por FOREIGN KEY (creado_por)
+        REFERENCES usuarios(id_usuario)
+);
+
+CREATE INDEX IX_clientes_cuit  ON clientes_mayoristas(cuit);
+CREATE INDEX IX_clientes_email ON clientes_mayoristas(email);
+
+
+-- ------------------------------------------------------------
+-- 4. CATÁLOGOS CON PDF  (tabla unificada)
+--    · 9 catálogos fijos, cada uno con su PDF.
+--    · Solo el superadmin puede subir o reemplazar el PDF.
+--    · Se guarda la ruta/URL del archivo en disco.
+-- ------------------------------------------------------------
+CREATE TABLE catalogos (
+    id_catalogo    INT            IDENTITY(1,1) PRIMARY KEY,
+    nombre         NVARCHAR(100)  NOT NULL UNIQUE,       -- ej: 'Catálogo Verano 2025'
+    descripcion    NVARCHAR(255)  NULL,
+    nombre_archivo NVARCHAR(255)  NULL,                  -- nombre original del PDF
+    ruta_url       NVARCHAR(500)  NULL,                  -- ruta en disco o URL pública
+    tamanio_kb     INT            NULL,                  -- tamaño del archivo en KB
+    subido_en      DATETIME2      NULL,                  -- fecha de la última subida
+    subido_por     INT            NULL,                  -- FK al superadmin que lo subió
+    activo         BIT            NOT NULL DEFAULT 1,
+    creado_en      DATETIME2      NOT NULL DEFAULT GETDATE(),
+
+    CONSTRAINT FK_catalogos_subido_por FOREIGN KEY (subido_por)
+        REFERENCES usuarios(id_usuario)
+);
+
+INSERT INTO catalogos (nombre) VALUES
+    ('Catálogo 1'),
+    ('Catálogo 2'),
+    ('Catálogo 3'),
+    ('Catálogo 4'),
+    ('Catálogo 5'),
+    ('Catálogo 6'),
+    ('Catálogo 7'),
+    ('Catálogo 8'),
+    ('Catálogo 9');
+
+
+-- ------------------------------------------------------------
+-- TRIGGER: solo el superadmin puede subir o reemplazar PDFs
+-- Segunda capa de seguridad (la primera es el backend).
+-- ------------------------------------------------------------
+GO
+CREATE TRIGGER TR_catalogo_solo_superadmin
+ON catalogos
+AFTER UPDATE
+AS
+BEGIN
+    SET NOCOUNT ON;
+    IF EXISTS (
+        SELECT 1
+        FROM inserted i
+        WHERE i.subido_por IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1
+              FROM usuarios u
+              JOIN roles r ON r.id_rol = u.id_rol
+              WHERE u.id_usuario = i.subido_por
+                AND r.nombre = 'superadmin'
+          )
+    )
+    BEGIN
+        RAISERROR('Solo el superadmin puede subir o reemplazar PDFs.', 16, 1);
+        ROLLBACK TRANSACTION;
+    END
+END;
+GO
+
+
+-- ============================================================
+--  RESUMEN DE TABLAS
+-- ============================================================
+--
+--  roles               → 2 roles fijos: superadmin y admin
+--
+--  usuarios            → superadmin y admins del sistema
+--                        login con email + password_hash
+--
+--  clientes_mayoristas → registrados por el admin
+--                        usuario de acceso: CUIT
+--                        código temporal enviado por mail
+--                        debe_cambiar_clave = 1 hasta que cambien
+--
+--  catalogos           → 9 catálogos con PDF integrado
+--                        ruta_url guarda dónde está el PDF
+--                        subido_por registra al superadmin
+--
+-- ============================================================
+--
+--  FLUJO DE REGISTRO DE UN CLIENTE MAYORISTA:
+--  1. Admin crea el cliente con CUIT, email y datos básicos
+--  2. Sistema genera código temporal aleatorio
+--  3. Se hashea y guarda en password_hash
+--  4. Se envía el código por email al cliente
+--  5. Cliente inicia sesión con CUIT + código temporal
+--  6. Sistema detecta debe_cambiar_clave = 1 → fuerza cambio
+--  7. Cliente elige nueva contraseña → se hashea y guarda
+--  8. debe_cambiar_clave se actualiza a 0
+--
+--  FLUJO DE SUBIDA DE PDF (solo superadmin):
+--  1. Superadmin selecciona catálogo en página de configuración
+--  2. Sube el archivo PDF
+--  3. Backend verifica rol superadmin
+--  4. Guarda el archivo en disco y obtiene la ruta
+--  5. UPDATE en catalogos: ruta_url, nombre_archivo,
+--     tamanio_kb, subido_en, subido_por
+--  6. Trigger confirma que subido_por es superadmin
+--
+-- ============================================================
