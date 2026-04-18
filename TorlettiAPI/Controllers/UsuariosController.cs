@@ -1,4 +1,5 @@
 using CatalogoAPI.Data;
+using CatalogoAPI.Services;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Mvc;
@@ -9,8 +10,8 @@ namespace CatalogoAPI.Controllers;
 
 [ApiController]
 [Route("api/[controller]")]
-[Authorize(Roles = "superadmin,admin")]// solo el superadmin accede a estos endpoints
-public class UsuariosController(AppDbContext db) : ControllerBase
+[Authorize(Roles = "superadmin")]// solo el superadmin accede a estos endpoints
+public class UsuariosController(AppDbContext db, EmailService email) : ControllerBase
 {
     private readonly PasswordHasher<string> _hasher = new();
 
@@ -60,6 +61,18 @@ public class UsuariosController(AppDbContext db) : ControllerBase
 
         db.Usuarios.Add(admin);
         await db.SaveChangesAsync();
+
+        // Intentar enviar notificación por email; si falla, no cancelar la creación.
+        try
+        {
+            var nombreCompleto = $"{admin.Nombre} {admin.Apellido}";
+            await email.EnviarCreacionAdminAsync(admin.Email, nombreCompleto);
+        }
+        catch (Exception ex)
+        {
+            // Log simple para diagnóstico sin exponer detalles al cliente.
+            Console.Error.WriteLine($"Error enviando email de creación de admin a {admin.Email}: {ex.Message}");
+        }
 
         return Ok(new { mensaje = $"Admin {req.Nombre} {req.Apellido} creado correctamente." });
     }
